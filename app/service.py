@@ -12,8 +12,10 @@ transaction.  That gives us two properties the task requires:
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, date, datetime
@@ -40,6 +42,8 @@ from .schemas import (
 from .timeutil import day_bounds, format_epoch, now_iso
 
 DAY_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +274,7 @@ def _compute(
     buildings: list[tuple[str, str]],
     powers: list[tuple[str, str]],
     branches: list[tuple[str, str, str, str, list[tuple[int, int, str]]]],
+    diagnostics: dict[str, int] | None = None,
 ) -> list[accounting.BuildingResult]:
     return accounting.compute_day_report(
         day_start=day_start,
@@ -285,7 +290,52 @@ def _compute(
             )
             for code, _name, node_a, node_b, segments in branches
         ],
+        diagnostics=diagnostics,
     )
+
+
+def _compute_timed(
+    day: str,
+    version: int | None,
+    day_start: int,
+    day_end: int,
+    buildings: list[tuple[str, str]],
+    powers: list[tuple[str, str]],
+    branches: list[tuple[str, str, str, str, list[tuple[int, int, str]]]],
+) -> list[accounting.BuildingResult]:
+    """Compute a report and log its duration (branch counts + elapsed ms)."""
+
+    diagnostics: dict[str, int] = {}
+    started = time.perf_counter()
+    try:
+        results = _compute(day_start, day_end, buildings, powers, branches, diagnostics)
+    except Exception as exc:
+        logger.exception(
+            "report computation failed day=%s version=%s branches=%d",
+            day,
+            version,
+            len(branches),
+        )
+        raise ApiError(
+            500,
+            "report_computation_failed",
+            "report computation failed; the previous report remains current",
+            day=day,
+        ) from exc
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    logger.info(
+        "report computed day=%s version=%s branches=%d stable=%d switching=%d "
+        "intervals=%d buildings=%d elapsed_ms=%.1f",
+        day,
+        version,
+        len(branches),
+        diagnostics.get("stable_branches", 0),
+        diagnostics.get("switching_branches", 0),
+        diagnostics.get("atomic_intervals", 0),
+        len(buildings),
+        elapsed_ms,
+    )
+    return results
 
 
 def _store_report(
@@ -404,7 +454,7 @@ def register_day(db_path: str, raw_day: str, body: DayRegistration) -> ReportOut
                         "VALUES (?, ?, ?, ?, ?, ?)",
                         (day, code, seq, start, end, state),
                     )
-            results = _compute(day_start, day_end, buildings, powers, branches)
+            results = _compute_timed(day, 1, day_start, day_end, buildings, powers, branches)
             _store_report(conn, day, 1, created_at, results)
 
         return _report_out(conn, day, 1)
@@ -524,8 +574,10 @@ def correct_branch(
                 )
 
             buildings, powers, branches = _load_topology(conn, day)
-            results = _compute(day_start, day_end, buildings, powers, branches)
             new_version = current + 1
+            results = _compute_timed(
+                day, new_version, day_start, day_end, buildings, powers, branches
+            )
             _store_report(conn, day, new_version, now_iso(), results)
 
         return new_version, _report_out(conn, day, new_version)

@@ -16,10 +16,40 @@ FastAPI + SQLite 实现的按 UTC 日核算服务：登记楼栋、全天带电�
   3. 否则（乐观可达、确定不可达）→ **待核实**。
 - **合并**：同一楼栋同类时段在结果中已合并为不重叠、按时间升序的区间；有电时段不返回。
 - **版号**：登记生成 v1。补正成功后原子地写入新支路记录并生成 v(n+1)，旧的日报版本永久保留、
-  仍可通过 `GET /days/{day}/report?version=n` 读取。补正失败（版本过期、校验失败、支路不存在）
-  不改变现行支路记录，也不产生新版本。
+  仍可通过 `GET /days/{day}/report?version=n` 读取。补正失败（版本过期、校验失败、支路不存在、
+  核算异常）不改变现行支路记录，也不产生新版本，原日报继续提供。
 - **并发**：所有写操作在 SQLite `BEGIN IMMEDIATE` 事务内完成；同版号并发补正最多一个成功，
   其余返回 409 `version_conflict`。
+
+## 核算性能
+
+真实日报里绝大多数支路整日只有一个状态，只有少数支路频繁切换。核算器因此把支路分两步处理：
+
+1. 把每条支路压缩成连续状态区间。只有一个区间的支路是**常态支路**，其余是**切换支路**。
+2. 常态 `on` 支路（乐观图里还包括常态 `unknown` 支路）先用并查集收缩成连通分量，
+   这一步对每个请求只做一次，就是可复用的“稳定支路连通信息”。
+3. 原子时间片的边界只来自切换支路。每个时间片只在收缩后的分量图上、用切换支路的当前边做
+   一次很小的可达性搜索，从不逐秒展开拓扑，也不会在每个切换点重扫全部支路。
+
+确定图（只走已知 `on`）和乐观图（也允许走记录空档）分别收缩、分别搜索，因此
+“并联支路 / 同秒切换 / 空档转为断开”都按原规则逐片判定。
+
+耗时对比（同一份合成日报，`scripts/benchmark.py`，本机 Python 3.11，单次运行、耗时随机器波动）：
+
+| 常态支路 | 切换支路 | 旧实现 | 优化后 | 加速 | 结果一致 |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 200 | 2 | 82.0 ms | 3.7 ms | 21.9x | 是 |
+| 1000 | 3 | 510.9 ms | 9.3 ms | 55.0x | 是 |
+| 3000 | 3 | 1683.8 ms | 22.3 ms | 75.5x | 是 |
+| 5000 | 2 | 2841.5 ms | 37.6 ms | 75.6x | 是 |
+
+`tests/reference_accounting.py` 保留了旧的全支路逐片算法，`tests/test_accounting_optimised.py`
+用它做随机对拍，并用 `diagnostics` 计数断言“每片只检查切换支路”：
+`branch_state_checks == atomic_intervals * switching_branches`。
+
+```bash
+python scripts/benchmark.py
+```
 
 ## 运行（Docker Compose）
 
@@ -100,7 +130,8 @@ python -m pip install -r requirements.txt && ./scripts/demo.sh
 
 错误响应统一为 `{"error": {"code": "...", "message": "...", ...}}`；常见 code：
 `validation_error`、`invalid_day`、`invalid_timestamp`、`segment_out_of_day`、
-`overlapping_segments`、`day_already_registered`、`version_conflict`、`branch_not_found`。
+`overlapping_segments`、`day_already_registered`、`version_conflict`、`branch_not_found`、
+`report_computation_failed`。
 
 `POST .../corrections` 成功时响应头带 `X-Report-Version`。
 
@@ -111,8 +142,9 @@ python -m pip install -r requirements-dev.txt
 python -m pytest
 ```
 
-测试覆盖：判定规则（未知→待核实、断开→停电、空洞、并联/环路、双向遍历）、
-与逐秒暴力实现的随机对拍、登记校验、补正成功/过期/非法、旧版本可读，
+测试覆盖：判定规则（未知→待核实、断开→停电、空洞、并联/环路、双向遍历、同秒切换、
+空档转为断开）、与逐秒暴力实现及旧全支路实现的随机对拍、常态支路多/切换支路少的耗时对比、
+登记校验、补正成功/过期/非法/核算失败回滚、旧版本可读，
 以及多线程同版并发补正只成功一次。
 
 ## 数据模型

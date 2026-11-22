@@ -371,3 +371,134 @@ def test_building_without_any_branch_is_out_all_day(client):
     assert a3["status"] == "confirmed_outage"
     assert a3["outages"] == [{"start": "2026-11-21T00:00:00Z", "end": "2026-11-22T00:00:00Z"}]
     assert a3["pending"] == []
+
+
+def stable_heavy_payload(building_count: int = 40) -> dict:
+    """Many all-day stable branches plus one frequently switching branch.
+
+    Every building hangs off the power source through its own stable ``on``
+    branch, so all buildings share one connected topology.  ``SW`` connects A0
+    to A1 in that same component and switches at noon.
+    """
+
+    buildings = [{"code": f"A{i}", "name": f"{i}号楼"} for i in range(building_count)]
+    branches = []
+    for index in range(building_count):
+        branches.append(
+            {
+                "code": f"S{index}",
+                "name": f"常态支路 {index}",
+                "node_a": "P1",
+                "node_b": f"A{index}",
+                "segments": [
+                    {"start": "2026-11-21T00:00:00Z", "end": "2026-11-22T00:00:00Z", "state": "on"}
+                ],
+            }
+        )
+    branches.append(
+        {
+            "code": "SW",
+            "name": "频繁切换支路",
+            "node_a": "A0",
+            "node_b": "A1",
+            "segments": [
+                {"start": "2026-11-21T00:00:00Z", "end": "2026-11-21T12:00:00Z", "state": "off"},
+                {"start": "2026-11-21T12:00:00Z", "end": "2026-11-22T00:00:00Z", "state": "on"},
+            ],
+        }
+    )
+    return {
+        "buildings": buildings,
+        "power_sources": [{"code": "P1", "name": "主配电房"}],
+        "branches": branches,
+    }
+
+
+def test_registration_on_stable_heavy_topology(client):
+    response = client.post(f"{BASE}/topology", json=stable_heavy_payload())
+    assert response.status_code == 201, response.text
+    report = response.json()
+    assert report["version"] == 1
+    # Every building has its own stable on branch, so all are powered.
+    assert report["buildings"]
+    for building in report["buildings"]:
+        assert building["outages"] == []
+        assert building["pending"] == []
+        assert building["status"] == "powered"
+
+
+def test_correction_on_stable_heavy_topology_uses_same_engine(client):
+    response = client.post(f"{BASE}/topology", json=stable_heavy_payload())
+    assert response.status_code == 201, response.text
+
+    # Cut A0's own stable branch; its remaining path is the switching SW
+    # branch through A1, which is still in the same connected component.
+    correction = client.post(
+        f"{BASE}/branches/S0/corrections",
+        json={
+            "expected_version": 1,
+            "segments": [
+                {"start": "2026-11-21T00:00:00Z", "end": "2026-11-22T00:00:00Z", "state": "off"}
+            ],
+        },
+    )
+    assert correction.status_code == 200, correction.text
+    assert correction.headers["x-report-version"] == "2"
+    a0 = next(b for b in correction.json()["buildings"] if b["code"] == "A0")
+    # SW is off until noon, so A0 is out in the morning and powered after.
+    assert a0["outages"] == [{"start": "2026-11-21T00:00:00Z", "end": "2026-11-21T12:00:00Z"}]
+    assert a0["pending"] == []
+    # Other buildings keep power through their own stable branches.
+    a1 = next(b for b in correction.json()["buildings"] if b["code"] == "A1")
+    assert a1["status"] == "powered"
+
+    old = client.get(f"{BASE}/report", params={"version": 1}).json()
+    assert old["version"] == 1
+    assert all(b["status"] == "powered" for b in old["buildings"])
+
+
+def test_failed_correction_keeps_original_report(tmp_path, monkeypatch):
+    """If recomputation raises, the transaction rolls back and v1 stays current."""
+
+    from fastapi.testclient import TestClient
+
+    from app import service
+    from app.main import create_app
+
+    app = create_app(str(tmp_path / "failure.db"))
+    with TestClient(app) as client:
+        register(client)
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("simulated accounting failure")
+
+        monkeypatch.setattr(service, "_compute", boom)
+        response = client.post(
+            f"{BASE}/branches/L2/corrections",
+            json={
+                "expected_version": 1,
+                "segments": [
+                    {
+                        "start": "2026-11-21T00:00:00Z",
+                        "end": "2026-11-22T00:00:00Z",
+                        "state": "on",
+                    }
+                ],
+            },
+        )
+        assert response.status_code == 500
+        assert response.json()["error"]["code"] == "report_computation_failed"
+
+        # Original report is still current and the branch record is untouched.
+        current = client.get(f"{BASE}/report").json()
+        assert current["version"] == 1
+        a2 = next(b for b in current["buildings"] if b["code"] == "A2")
+        assert a2["outages"] == [
+            {"start": "2026-11-21T00:00:00Z", "end": "2026-11-22T00:00:00Z"}
+        ]
+        topology = client.get(f"{BASE}/topology").json()
+        l2 = next(b for b in topology["branches"] if b["code"] == "L2")
+        assert l2["segments"] == [
+            {"start": "2026-11-21T00:00:00Z", "end": "2026-11-22T00:00:00Z", "state": "off"}
+        ]
+        assert [v["version"] for v in client.get(f"{BASE}/versions").json()["versions"]] == [1]

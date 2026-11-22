@@ -132,3 +132,105 @@ def test_per_branch_state_changes_split_buildings_independently():
     assert by_code["B1"].outages == () and by_code["B1"].pending == ()
     assert by_code["B2"].outages == ((ts(12), DAY_END),)
     assert by_code["B2"].pending == ()
+
+
+def test_parallel_branches_keep_power_when_one_turns_off():
+    # B1 --L1-- P1 and B1 --L2-- P1 in parallel; L2 cuts at noon but L1 stays on.
+    result = compute_day_report(
+        DAY_START,
+        DAY_END,
+        [BuildingInput("B1", "B1")],
+        {"P1"},
+        [
+            BranchInput("L1", "B1", "P1", ((DAY_START, DAY_END, "on"),)),
+            BranchInput(
+                "L2",
+                "B1",
+                "P1",
+                ((DAY_START, ts(12), "on"), (ts(12), DAY_END, "off")),
+            ),
+        ],
+    )[0]
+    assert result.outages == ()
+    assert result.pending == ()
+
+
+def test_parallel_branches_pending_when_only_unknown_remains():
+    # L2 off at noon; L1 becomes an unknown gap for the rest of the day.
+    result = compute_day_report(
+        DAY_START,
+        DAY_END,
+        [BuildingInput("B1", "B1")],
+        {"P1"},
+        [
+            BranchInput("L1", "B1", "P1", ((DAY_START, ts(12), "on"),)),
+            BranchInput(
+                "L2",
+                "B1",
+                "P1",
+                ((DAY_START, ts(12), "on"), (ts(12), DAY_END, "off")),
+            ),
+        ],
+    )[0]
+    assert result.outages == ()
+    assert result.pending == ((ts(12), DAY_END),)
+
+
+def test_same_second_switches_do_not_create_zero_length_intervals():
+    # Two branches switch at 06:00 and 12:00; boundaries must merge cleanly.
+    result = compute_day_report(
+        DAY_START,
+        DAY_END,
+        [BuildingInput("B1", "B1"), BuildingInput("B2", "B2")],
+        {"P1"},
+        [
+            BranchInput(
+                "L1",
+                "B1",
+                "P1",
+                ((DAY_START, ts(6), "on"), (ts(6), ts(12), "off"), (ts(12), DAY_END, "on")),
+            ),
+            BranchInput(
+                "L2",
+                "B2",
+                "P1",
+                ((DAY_START, ts(6), "off"), (ts(6), ts(12), "on"), (ts(12), DAY_END, "off")),
+            ),
+        ],
+    )
+    by_code = {item.code: item for item in result}
+    assert by_code["B1"].outages == ((ts(6), ts(12)),)
+    assert by_code["B1"].pending == ()
+    assert by_code["B2"].outages == ((DAY_START, ts(6)), (ts(12), DAY_END))
+    assert by_code["B2"].pending == ()
+
+
+def test_gap_turning_into_off_is_outage():
+    # Identical topology, but the former unknown gap is recorded as off:
+    # pending must turn into a confirmed outage.
+    unknown_gap = compute_day_report(
+        DAY_START,
+        DAY_END,
+        [BuildingInput("B1", "B1")],
+        {"P1"},
+        [BranchInput("L1", "B1", "P1", ((DAY_START, ts(8), "on"), (ts(10), DAY_END, "on")))],
+    )[0]
+    assert unknown_gap.outages == ()
+    assert unknown_gap.pending == ((ts(8), ts(10)),)
+
+    recorded_off = compute_day_report(
+        DAY_START,
+        DAY_END,
+        [BuildingInput("B1", "B1")],
+        {"P1"},
+        [
+            BranchInput(
+                "L1",
+                "B1",
+                "P1",
+                ((DAY_START, ts(8), "on"), (ts(8), ts(10), "off"), (ts(10), DAY_END, "on")),
+            )
+        ],
+    )[0]
+    assert recorded_off.outages == ((ts(8), ts(10)),)
+    assert recorded_off.pending == ()

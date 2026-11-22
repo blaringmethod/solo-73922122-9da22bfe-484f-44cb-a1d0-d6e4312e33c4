@@ -13,6 +13,7 @@ GET  /days/{day}/topology          inspect the registered topology
 
 from __future__ import annotations
 
+import logging
 import os
 from contextlib import asynccontextmanager
 from typing import Any
@@ -34,6 +35,10 @@ from .schemas import (
 )
 
 DB_PATH = os.environ.get("OUTAGE_DB_PATH", "data/outage.db")
+
+# uvicorn configures its own loggers; make sure the service logger's INFO
+# messages (report branch counts and elapsed time) are visible in `docker logs`.
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
 
 
 def _status_payload(report: ReportOut) -> dict[str, Any]:
